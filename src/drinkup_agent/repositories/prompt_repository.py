@@ -42,3 +42,13 @@ class PromptRepository:
         """
         prompt = await self.find_by_type(PromptTypeEnum.CHAT_STREAM.value)
         return prompt.system_prompt if prompt else None
+
+    async def get_moments_prompt(self) -> Optional[str]:
+        """
+        Get the 开喝时刻 summarization prompt from database.
+
+        Returns:
+            System prompt string if found, None otherwise (caller falls back to hardcoded).
+        """
+        prompt = await self.find_by_type(PromptTypeEnum.MOMENTS.value)
+        return prompt.system_prompt if prompt else None

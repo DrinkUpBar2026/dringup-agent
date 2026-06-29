@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from .config import settings
 from .api.chat_stream import router as chat_stream_router
+from .api.insights import router as insights_router
 from .database.init import init_database
 
 # 配置日志级别
@@ -117,6 +118,7 @@ def create_app() -> FastAPI:
 
     # Include routers
     app.include_router(chat_stream_router, prefix=f"{settings.api_prefix}")
+    app.include_router(insights_router, prefix=f"{settings.api_prefix}")
 
     @app.get("/")
     async def root():

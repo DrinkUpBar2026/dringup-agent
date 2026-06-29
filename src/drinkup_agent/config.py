@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_model: str = "gpt-4o-mini"
     openai_base_url: Optional[str] = None
+    # 「开喝时刻」场景总结用的模型；留空则复用 openai_model。可设成更便宜的模型省钱。
+    insights_model: Optional[str] = None
 
     # LangSmith / LangChain Tracing Configuration
     # When enabled, LangChain will send traces to LangSmith
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     langsmith_project: Optional[str] = "drinkup-dev"
 
     # Mem0 Configuration (Optional - enables memory tools when provided)
+    memory_enabled: bool = False
     mem0_api_key: Optional[str] = None
     mem0_base_url: Optional[str] = "https://api.mem0.ai"
 
@@ -61,6 +64,7 @@ class Settings(BaseSettings):
 
     # DrinkUp Backend Configuration
     drinkup_backend_url: str = "http://localhost:8080"
+    drinkup_backend_timeout: float = 600.0
 
     # Redis Configuration
     redis_host: str = "localhost"
