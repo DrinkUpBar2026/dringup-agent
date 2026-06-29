@@ -19,7 +19,7 @@ from ..config import settings
 from ..repositories import PromptRepository
 from ..services.conversation_service import ConversationService
 from ..tools.mem0_tools import create_mem0_tools
-from ..tools.drinkup_backend_tools import create_drinkup_backend_tools
+from ..tools.drinkup_backend_tools import create_drinkup_backend_tools, QUOTA_EXCEEDED_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,9 @@ class StreamingLangGraphAgentService:
         """Get all available tools for the agent."""
         tools = []
 
-        # Add Mem0 tools if configured
-        if settings.openai_api_key:
+        # Add Mem0 tools only when explicitly enabled. Local core-flow debugging
+        # should not be blocked by memory/embedding configuration.
+        if settings.memory_enabled:
             mem0_tools = create_mem0_tools(
                 api_key=settings.openai_api_key, user_id=user_id
             )
@@ -109,6 +110,7 @@ Respond naturally without JSON formatting."""
         user_stock: Optional[str] = None,
         user_info: Optional[str] = None,
         image_attachments: Optional[List[Dict[str, Any]]] = None,
+        history: Optional[List[Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Process a chat message with character-level streaming.
@@ -119,6 +121,32 @@ Respond naturally without JSON formatting."""
             conversation_id = str(uuid.uuid4())
             is_new_conversation = True
             logger.info(f"Generated new conversation_id: {conversation_id}")
+
+        # Cold-start re-seed: the server-side conversation cache only lives 24h.
+        # When it has expired (or this is a new id) but the client carried prior
+        # turns, seed them so the agent regains context. Skip if Redis still has it.
+        if history:
+            try:
+                existing = await self.conversation_service.get_messages(conversation_id)
+                if not existing:
+                    seeded = 0
+                    for m in history:
+                        role = getattr(m, "role", None) or (
+                            m.get("role") if isinstance(m, dict) else None
+                        )
+                        content = getattr(m, "content", None) or (
+                            m.get("content") if isinstance(m, dict) else None
+                        )
+                        if role and content:
+                            await self.conversation_service.add_message(
+                                conversation_id, role, content
+                            )
+                            seeded += 1
+                    logger.info(
+                        f"Re-seeded {seeded} message(s) into conversation {conversation_id} from client history"
+                    )
+            except Exception as seed_err:
+                logger.warning(f"Failed to re-seed conversation history: {seed_err}")
 
         try:
             # Prepare a LangChain/LangSmith run config so all runs carry the same thread ID
@@ -158,6 +186,7 @@ Respond naturally without JSON formatting."""
             # Stream the first response (may contain tool calls)
             full_content = ""
             is_tool_call = False
+            quota_blocked_turn = False  # 本轮出卡是否因免费额度用尽被拦
             accumulated_message = None
             usage_data = None
             finish_reason = None
@@ -211,6 +240,14 @@ Respond naturally without JSON formatting."""
                 for ev in tool_events:
                     yield ev
 
+                # 检测本轮出卡是否因免费额度用尽被拦（工具结果带超额标志）
+                quota_blocked_turn = any(
+                    ev.get("type") == "tool_result"
+                    and (ev.get("data") or {}).get("tool") == "generate_cocktail"
+                    and QUOTA_EXCEEDED_MARKER in ((ev.get("data") or {}).get("result") or "")
+                    for ev in tool_events
+                )
+
                 # Add tool results to messages and ask for final response
                 messages_with_system.extend(tool_results_messages)
 
@@ -239,10 +276,13 @@ Respond naturally without JSON formatting."""
                 usage_data = self._merge_usage(usage_data, final_usage_data)
                 full_content = final_content or full_content
 
-            # Persist conversation turns (user message already saved if new conversation)
-            if not is_new_conversation:
-                await self.conversation_service.add_message(conversation_id, "user", user_message)
-            await self.conversation_service.add_message(conversation_id, "assistant", full_content)
+            # Persist conversation turns (user message already saved if new conversation)。
+            # 超额被拦那一轮不落库 user/assistant，配合历史加载时过滤掉工具调用，
+            # 让这一轮在记忆里「不留痕迹」——否则模型记住用户超额，之后不再尝试出卡，付费墙就不再弹（影响转化）。
+            if not quota_blocked_turn:
+                if not is_new_conversation:
+                    await self.conversation_service.add_message(conversation_id, "user", user_message)
+                await self.conversation_service.add_message(conversation_id, "assistant", full_content)
 
             # Compute usage for final response
             usage = (
@@ -275,6 +315,16 @@ Respond naturally without JSON formatting."""
 
     def _convert_history_to_langchain(self, messages: List[Dict[str, Any]]):
         """Convert stored conversation messages to LangChain message objects."""
+        # 先找出「超额被拦」的工具结果（带标志），收集其 tool_call_id。
+        # 这些 generate_cocktail 调用因免费额度用尽而失败，要从历史里成对剔除（工具调用 + 结果），
+        # 否则模型会学到用户超额、之后不再尝试出卡，付费墙就不再触发。
+        quota_blocked_ids = set()
+        for msg in messages:
+            if msg.get("role") == "tool" and QUOTA_EXCEEDED_MARKER in (msg.get("content") or ""):
+                tcid = (msg.get("metadata") or {}).get("tool_call_id")
+                if tcid:
+                    quota_blocked_ids.add(tcid)
+
         chat_history: List[Any] = []
         for msg in messages:
             role = msg.get("role")
@@ -283,15 +333,21 @@ Respond naturally without JSON formatting."""
             elif role == "assistant":
                 metadata = msg.get("metadata", {})
                 tool_calls = metadata.get("tool_calls", [])
+                # 剔除超额被拦的工具调用，保留模型当时说的话
+                if tool_calls and quota_blocked_ids:
+                    tool_calls = [tc for tc in tool_calls if tc.get("id") not in quota_blocked_ids]
+                content = msg.get("content", "")
                 if tool_calls:
-                    chat_history.append(
-                        AIMessage(content=msg.get("content", ""), tool_calls=tool_calls)
-                    )
-                else:
-                    chat_history.append(AIMessage(content=msg.get("content", "")))
+                    chat_history.append(AIMessage(content=content, tool_calls=tool_calls))
+                elif content:
+                    chat_history.append(AIMessage(content=content))
+                # 否则（工具调用被剔空且无文本的超额轮）：整条跳过，不留痕迹
             elif role == "tool":
                 metadata = msg.get("metadata", {})
                 tool_call_id = metadata.get("tool_call_id")
+                # 跳过超额被拦的工具结果
+                if tool_call_id and tool_call_id in quota_blocked_ids:
+                    continue
                 if tool_call_id:
                     chat_history.append(
                         ToolMessage(content=msg.get("content", ""), tool_call_id=tool_call_id)
@@ -311,6 +367,9 @@ Respond naturally without JSON formatting."""
                 else:
                     mime_type = attachment.get("mime_type", "image/jpeg")
                     image_base64 = attachment.get("image_base64")
+                if not image_base64:
+                    logger.warning("Skipping image attachment without base64 data")
+                    continue
                 image_data = {
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime_type};base64,{image_base64}"},

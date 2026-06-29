@@ -36,7 +36,7 @@ def _sanitize_for_log(data: Any) -> Any:
             new_obj = {}
             for k, v in obj.items():
                 if k in BASE64_KEYS:
-                    new_obj[k] = "<imageBase64 omitted>"
+                    new_obj[k] = "<imageBase64 omitted>" if v else v
                 else:
                     new_obj[k] = sanitize(v)
             return new_obj
@@ -111,6 +111,7 @@ async def chat_stream(request: Dict[str, Any]):
                     conversation_id=request.get(
                         "conversationId", request.get("conversation_id")
                     ),
+                    history=request.get("history"),
                     params=ChatParams(
                         user_stock=request.get("params", {}).get("userStock", "") or request.get("params", {}).get("user_stock", ""),
                         user_info=request.get("params", {}).get("userInfo", "") or request.get("params", {}).get("user_info", ""),
@@ -141,6 +142,7 @@ async def chat_stream(request: Dict[str, Any]):
             user_message = chat_request.user_message
             user_id = chat_request.user_id
             conversation_id = chat_request.conversation_id
+            history = chat_request.history
 
             # Get user context from params
             params = chat_request.params
@@ -158,6 +160,7 @@ async def chat_stream(request: Dict[str, Any]):
                 user_stock=user_stock,
                 user_info=user_info,
                 image_attachments=image_attachments,
+                history=history,
             ):
                 logger.info(f"Event: {event}")
                 # Format as Server-Sent Event
@@ -274,6 +277,11 @@ async def save_conversation_to_memory(request: Dict[str, Any]):
     }
     """
     try:
+        if not settings.memory_enabled:
+            raise HTTPException(
+                status_code=503, detail="Memory service is disabled"
+            )
+
         # Extract parameters
         conversation_id = request.get("conversationId", request.get("conversation_id"))
         user_id = request.get("userId", request.get("user_id"))

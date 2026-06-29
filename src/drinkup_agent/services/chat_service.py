@@ -21,7 +21,10 @@ class ChatService:
                 image_attachments = [
                     {"image_base64": att.image_base64, "mime_type": att.mime_type}
                     for att in request.params.image_attachment_list
+                    if att.image_base64
                 ]
+                if not image_attachments:
+                    image_attachments = None
 
             # Call agent service
             result = await self.agent_service.chat_with_agent(

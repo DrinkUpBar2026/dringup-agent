@@ -14,7 +14,7 @@ class ChatMessage(BaseModel):
 class ImageAttachment(BaseModel):
     """Image attachment for chat."""
 
-    image_base64: str = Field(..., description="Base64 encoded image data")
+    image_base64: Optional[str] = Field(None, description="Base64 encoded image data")
     mime_type: Optional[str] = Field("image/jpeg", description="MIME type of the image")
     
     class Config:
@@ -38,6 +38,13 @@ class ChatV2Request(BaseModel):
     user_id: str = Field(..., description="User ID for memory management")
     conversation_id: Optional[str] = Field(
         None, description="Conversation ID for context"
+    )
+    history: Optional[List[ChatMessage]] = Field(
+        None,
+        description=(
+            "Client-provided prior turns. Used to re-seed context when the "
+            "server-side conversation cache (24h Redis) has expired."
+        ),
     )
     params: ChatParams = Field(
         default_factory=ChatParams, description="Chat parameters"

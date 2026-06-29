@@ -11,6 +11,10 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+# 免费额度用尽（后端返回 402）时，generate_cocktail 工具结果的前缀标志。
+# 加载对话历史时用它识别并过滤掉「超额被拦」那一轮，避免模型学到用户超额、后续不再尝试出卡。
+QUOTA_EXCEEDED_MARKER = "[QUOTA_EXCEEDED]"
+
 
 class GenerateCocktailInput(BaseModel):
     """Input for generating a cocktail recipe. If using user's stock materials, include the details in the user_demand."""
@@ -63,7 +67,9 @@ class GenerateCocktailTool(BaseTool):
             logger.info(f"Request payload: {payload}")
 
             # Make the API call
-            async with httpx.AsyncClient(timeout=300.0) as client:
+            async with httpx.AsyncClient(
+                timeout=settings.drinkup_backend_timeout
+            ) as client:
                 response = await client.post(
                     url, json=payload, headers={"Content-Type": "application/json"}
                 )
@@ -79,9 +85,14 @@ class GenerateCocktailTool(BaseTool):
                 result = response.json()
 
                 # Check business status code
-                if result.get("code") != 0:
+                code = result.get("code")
+                if code != 0:
                     error_msg = result.get("message", "Unknown error")
                     logger.error(f"Business error: {error_msg}")
+                    # 402 = 今日免费额度用尽：带标志返回，供加载历史时把这一轮过滤掉，
+                    # 避免模型「学到用户超额」后续不再尝试出卡（否则付费墙不再触发，影响转化）。
+                    if code == 402:
+                        return f"{QUOTA_EXCEEDED_MARKER} {error_msg}"
                     return f"Error generating cocktail: {error_msg}"
 
                 # Extract cocktail data
@@ -142,7 +153,9 @@ class SearchCocktailTool(BaseTool):
             logger.info(f"Request payload: {payload}")
 
             # Make the API call
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(
+                timeout=settings.drinkup_backend_timeout
+            ) as client:
                 response = await client.post(
                     url, json=payload, headers={"Content-Type": "application/json"}
                 )
