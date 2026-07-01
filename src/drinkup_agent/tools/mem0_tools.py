@@ -86,6 +86,19 @@ class Mem0Manager:
                                             "embedding_model", "text-embedding-3-large"
                                         ),
                                         "api_key": embedding_api_key or api_key,  # Use embedding API key if available
+                                        "openai_base_url": embedding_base_url,
+                                    },
+                                },
+                                # mem0's fact-extraction LLM. Must match the embedding
+                                # provider (both routed through embedding creds/base_url).
+                                # Aliyun Bailian etc. reject OpenAI model names, so make
+                                # the model explicit/overridable via MEM0_LLM_MODEL.
+                                "llm": {
+                                    "provider": "openai",
+                                    "config": {
+                                        "model": os.getenv("MEM0_LLM_MODEL", "qwen-plus"),
+                                        "api_key": embedding_api_key or api_key,
+                                        "openai_base_url": embedding_base_url,
                                     },
                                 },
                                 "version": "v1.1",
