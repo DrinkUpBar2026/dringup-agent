@@ -3,6 +3,7 @@
 import json
 import uuid
 import logging
+import re
 from typing import Optional, List, Dict, Any, AsyncIterator
 
 from langchain_openai import ChatOpenAI
@@ -49,7 +50,7 @@ class StreamingLangGraphAgentService:
 
         self.llm = ChatOpenAI(**llm_params)
 
-    async def _get_tools(self, user_id: str) -> List[BaseTool]:
+    async def _get_tools(self, user_id: str, language: Optional[str] = None) -> List[BaseTool]:
         """Get all available tools for the agent."""
         tools = []
 
@@ -61,8 +62,8 @@ class StreamingLangGraphAgentService:
             )
             tools.extend(mem0_tools)
 
-        # Add DrinkUp backend tools with user_id
-        drinkup_tools = create_drinkup_backend_tools(user_id=user_id)
+        # Add DrinkUp backend tools with user_id and response language.
+        drinkup_tools = create_drinkup_backend_tools(user_id=user_id, language=language)
         tools.extend(drinkup_tools)
 
         return tools
@@ -111,6 +112,7 @@ Respond naturally without JSON formatting."""
         user_info: Optional[str] = None,
         image_attachments: Optional[List[Dict[str, Any]]] = None,
         history: Optional[List[Any]] = None,
+        language: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Process a chat message with character-level streaming.
@@ -173,12 +175,31 @@ Respond naturally without JSON formatting."""
                 chat_history.append(user_msg)
 
             # Get tools and system prompt
-            tools = await self._get_tools(user_id)
+            tools = await self._get_tools(user_id, language)
             system_prompt = await self._build_system_prompt()
-            formatted_prompt = self._format_prompt(system_prompt, user_info, user_stock)
+            formatted_prompt = self._format_prompt(system_prompt, user_info, user_stock, language)
 
             # Create messages with system prompt
             messages_with_system = [SystemMessage(content=formatted_prompt)] + chat_history
+
+            # Keep the locale constraint adjacent to the latest user turn. The base bartender
+            # prompt and user context can be long and Chinese-heavy, so a single instruction at
+            # the end of that prompt is not reliable enough for every model response.
+            language_name = self.LANGUAGE_NAMES.get(language or "")
+            if language_name:
+                language_guard = SystemMessage(
+                    content=(
+                        f"MANDATORY RESPONSE LOCALE: {language_name}. "
+                        f"Answer the latest user request only in {language_name}. "
+                        "Do not copy the language of inventory, profile, memory, tool output, or "
+                        "the base bartender prompt. "
+                        f"{self.LANGUAGE_STYLE_RULES.get(language or '', '')}"
+                    )
+                )
+                insert_at = len(messages_with_system)
+                if chat_history and isinstance(chat_history[-1], HumanMessage):
+                    insert_at -= 1
+                messages_with_system.insert(insert_at, language_guard)
 
             # Bind tools to LLM
             llm_with_tools = self.llm.bind_tools(tools) if tools else self.llm
@@ -215,7 +236,14 @@ Respond naturally without JSON formatting."""
                 elif hasattr(chunk, "content") and chunk.content:
                     content_chunk = chunk.content
                     full_content += content_chunk
-                    yield {"type": "streaming_content", "data": {"content": content_chunk}}
+                    if not language_name:
+                        yield {"type": "streaming_content", "data": {"content": content_chunk}}
+
+            if language_name and full_content:
+                full_content = await self._ensure_response_language(
+                    full_content, language or "", run_config
+                )
+                yield {"type": "streaming_content", "data": {"content": full_content}}
 
             if finish_reason in ["stop", "tool_calls"] and full_content:
                 yield {"type": "final_message", "data": {"content": full_content}}
@@ -268,7 +296,14 @@ Respond naturally without JSON formatting."""
                     if hasattr(chunk, "content") and chunk.content:
                         content_chunk = chunk.content
                         final_content += content_chunk
-                        yield {"type": "streaming_content", "data": {"content": content_chunk}}
+                        if not language_name:
+                            yield {"type": "streaming_content", "data": {"content": content_chunk}}
+
+                if language_name and final_content:
+                    final_content = await self._ensure_response_language(
+                        final_content, language or "", run_config
+                    )
+                    yield {"type": "streaming_content", "data": {"content": final_content}}
 
                 if final_finish_reason == "stop":
                     yield {"type": "final_message", "data": {"content": final_content}}
@@ -378,8 +413,81 @@ Respond naturally without JSON formatting."""
             return HumanMessage(content=message_content)
         return HumanMessage(content=user_message)
 
+    LANGUAGE_NAMES = {"en": "English", "ja": "Japanese (日本語)", "ko": "Korean (한국어)"}
+    LANGUAGE_STYLE_RULES = {
+        "en": "Use English only. Do not include Chinese words or Chinese characters.",
+        "ja": (
+            "Use natural, idiomatic Japanese throughout. Japanese kanji is allowed where normal, "
+            "but do not use Simplified-Chinese-only vocabulary, Chinese ingredient names, or "
+            "Chinese-style literal translations of cocktail names. Write established cocktail "
+            "names and foreign ingredient names in the standard Japanese katakana used in Japan "
+            "(for example, write White Lady as ホワイト・レディ, never 白色淑女)."
+        ),
+        "ko": (
+            "Use natural Korean throughout. Do not use Chinese characters (hanja) or Chinese-only "
+            "words; transliterate ingredient names into Hangul."
+        ),
+    }
+    LANGUAGE_FALLBACKS = {
+        "en": "Sorry, I couldn't prepare an English response. Please try again.",
+        "ja": "申し訳ありません。日本語の応答を生成できませんでした。もう一度お試しください。",
+        "ko": "죄송합니다. 한국어 답변을 생성하지 못했습니다. 다시 시도해 주세요.",
+    }
+
+    @staticmethod
+    def _has_language_mismatch(content: str, language: str) -> bool:
+        han = re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", content)
+        kana = re.search(r"[\u3040-\u30ff]", content)
+        hangul = re.search(r"[\uac00-\ud7af]", content)
+        if language == "en":
+            return bool(han or kana or hangul)
+        if language == "ko":
+            return bool(han or kana)
+        if language == "ja":
+            return bool(hangul or (han and not kana))
+        return False
+
+    async def _ensure_response_language(
+        self, content: str, language: str, run_config: Dict[str, Any]
+    ) -> str:
+        if not self._has_language_mismatch(content, language):
+            return content
+
+        language_name = self.LANGUAGE_NAMES.get(language, language)
+        logger.warning("Detected mixed-language response for locale %s; rewriting", language)
+        candidate = content
+        for attempt in range(2):
+            repair_messages = [
+                SystemMessage(
+                    content=(
+                        f"Rewrite the supplied assistant response entirely in {language_name}. "
+                        "Preserve its meaning and any <options> structure, but do not add facts. "
+                        f"{self.LANGUAGE_STYLE_RULES.get(language, '')}"
+                    )
+                ),
+                HumanMessage(content=candidate),
+            ]
+            repaired = await self.llm.ainvoke(repair_messages, config=run_config)
+            repaired_content = getattr(repaired, "content", "")
+            if isinstance(repaired_content, str) and repaired_content.strip():
+                candidate = repaired_content.strip()
+                if not self._has_language_mismatch(candidate, language):
+                    logger.info(
+                        "Mixed-language response repaired for locale %s on attempt %s",
+                        language,
+                        attempt + 1,
+                    )
+                    return candidate
+
+        logger.error("Could not repair response language for locale %s", language)
+        return self.LANGUAGE_FALLBACKS.get(language, content)
+
     def _format_prompt(
-        self, system_prompt: str, user_info: Optional[str], user_stock: Optional[str]
+        self,
+        system_prompt: str,
+        user_info: Optional[str],
+        user_stock: Optional[str],
+        language: Optional[str] = None,
     ) -> str:
         """Interpolate user context placeholders in the system prompt."""
         formatted = system_prompt
@@ -387,6 +495,14 @@ Respond naturally without JSON formatting."""
         formatted = formatted.replace("{userStock}", user_stock or "Not provided")
         formatted = formatted.replace("{user_info}", user_info or "Not provided")
         formatted = formatted.replace("{user_stock}", user_stock or "Not provided")
+        language_name = self.LANGUAGE_NAMES.get(language or "")
+        if language_name:
+            formatted += (
+                f"\n\nIMPORTANT: The user's app language is {language_name}. "
+                f"Always reply in {language_name}, regardless of the language used above. "
+                f"Keep every sentence, suggestion label, and ingredient name in one consistent language. "
+                f"{self.LANGUAGE_STYLE_RULES.get(language or '', '')}"
+            )
         return formatted
 
     def _extract_tool_calls_for_thinking(self, accumulated_message: Any) -> List[Dict[str, Any]]:

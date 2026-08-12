@@ -152,6 +152,9 @@ async def chat_stream(request: Dict[str, Any]):
             # Get image attachments if any
             image_attachments = params.image_attachment_list
 
+            # User language propagated by the Java backend from Accept-Language.
+            language = request.get("language") or "zh"
+
             # Stream responses from agent
             async for event in agent_service.chat_with_agent_stream(
                 user_message=user_message,
@@ -161,6 +164,7 @@ async def chat_stream(request: Dict[str, Any]):
                 user_info=user_info,
                 image_attachments=image_attachments,
                 history=history,
+                language=language,
             ):
                 logger.info(f"Event: {event}")
                 # Format as Server-Sent Event

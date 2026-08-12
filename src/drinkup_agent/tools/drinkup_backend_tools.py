@@ -44,6 +44,7 @@ class GenerateCocktailTool(BaseTool):
     )
     args_schema: Type[BaseModel] = GenerateCocktailInput
     user_id: Optional[int] = None  # Store user_id for the API request
+    language: Optional[str] = None
 
     def _run(self, user_demand: str) -> str:
         """Execute the tool synchronously."""
@@ -61,6 +62,7 @@ class GenerateCocktailTool(BaseTool):
                 "user_id": self.user_id
                 if self.user_id
                 else 0,  # Use provided user_id or default to 0
+                "language": self.language or "zh",
             }
 
             logger.info(f"Calling DrinkUp backend API: {url}")
@@ -191,11 +193,12 @@ class SearchCocktailTool(BaseTool):
             return f"An unexpected error occurred: {str(e)}"
 
 
-def create_drinkup_backend_tools(user_id: Optional[str] = None) -> list:
+def create_drinkup_backend_tools(user_id: Optional[str] = None, language: Optional[str] = None) -> list:
     """Create and return DrinkUp backend tools.
 
     Args:
         user_id: Optional user ID to associate with generated cocktails
+        language: User app language (zh/en/ja/ko) for generated drink-card copy
     """
     # Convert string user_id to int if provided
     user_id_int = None
@@ -207,7 +210,7 @@ def create_drinkup_backend_tools(user_id: Optional[str] = None) -> list:
             user_id_int = None
 
     tools = [
-        GenerateCocktailTool(user_id=user_id_int),
+        GenerateCocktailTool(user_id=user_id_int, language=language),
         SearchCocktailTool(),
     ]
 
